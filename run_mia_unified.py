@@ -14,9 +14,11 @@ import os
 import json
 import functools
 import custom_datasets
+from data_module import get_model_identifiers_from_yaml
 from multiprocessing.pool import ThreadPool
 import time
 import math
+import yaml
 
 
 torch.manual_seed(0)
@@ -31,6 +33,12 @@ COLORS = ["#0072B2", "#009E73", "#D55E00", "#CC79A7", "#F0E442",
 # define regex to match all <extra_id_*> tokens, where * is an integer
 pattern = re.compile(r"<extra_id_\d+>")
 
+def get_config_from_yaml(path):
+    #path is model_configs.yaml
+    configs  = {}
+    with open(path, "r") as f:
+        configs = yaml.load(f, Loader=yaml.FullLoader)
+    return configs
 
 def load_base_model():
     print('MOVING BASE MODEL TO GPU...', end='', flush=True)
@@ -63,8 +71,7 @@ def load_mask_model():
         base_model.cpu()
     if not args.random_fills:
         mask_model.to(DEVICE)
-    print(f'DONE ({time.time() - start:.2f}s)')
-
+    print(f'DONE ({time.time() - start:.2f}s)')   
 
 def tokenize_and_mask(text, span_length, pct, ceil_pct=False):
     tokens = text.split(' ')
@@ -700,43 +707,47 @@ def generate_samples(raw_data_member, raw_data_non_member, batch_size):
     return data, seq_lens, n_samples
 
 
-def generate_data(dataset,key,train=True):
+def generate_data(dataset, key, train=True):
     # load data
     data_split = 'train' if train else 'test'
-    if dataset in custom_datasets.DATASETS:
-        data = custom_datasets.load(dataset, cache_dir)
-    elif dataset == 'the_pile' and data_split=='train':
-        #data_files = "https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz"
-        #data_files="/home/niloofar/projects/enron_mail_20150507.tar.gz"
-        #data_files ="/home/niloofar/projects/maildir"
-        #data = datasets.load_dataset("json", data_files=data_files, split="train", cache_dir=cache_dir)[key]
-        #data = datasets.load_dataset("json",data_files=data_files, split='train', cache_dir=cache_dir)[key]https://the-eye.eu/public/AI/pile/train/00.jsonl.zst"
-        data = datasets.load_dataset("json", data_files="/trunk/datasets/niloofar/pile/00.jsonl.zst",  split=f"{data_split}[:10000]")[key]
-    elif dataset == 'the_pile' and data_split=='test':
-        print("test")
-        data = datasets.load_dataset("json", data_files="/trunk/datasets/niloofar/pile/test.jsonl.zst",split=f"train[:10000]")[key]
+    if type(dataset) == str:
+        if dataset in custom_datasets.DATASETS:
+            data = custom_datasets.load(dataset, cache_dir)
+        elif dataset == 'the_pile' and data_split=='train':
+            #data_files = "https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz"
+            #data_files="/home/niloofar/projects/enron_mail_20150507.tar.gz"
+            #data_files ="/home/niloofar/projects/maildir"
+            #data = datasets.load_dataset("json", data_files=data_files, split="train", cache_dir=cache_dir)[key]
+            #data = datasets.load_dataset("json",data_files=data_files, split='train', cache_dir=cache_dir)[key]https://the-eye.eu/public/AI/pile/train/00.jsonl.zst"
+            data = datasets.load_dataset("json", data_files="/trunk/datasets/niloofar/pile/00.jsonl.zst",  split=f"{data_split}[:10000]")[key]
+        elif dataset == 'the_pile' and data_split=='test':
+            print("test")
+            data = datasets.load_dataset("json", data_files="/trunk/datasets/niloofar/pile/test.jsonl.zst",split=f"train[:10000]")[key]
+        else:
+            data = datasets.load_dataset(dataset, split=f'train[:10000]', cache_dir=cache_dir)[key]
+        
+        # remove duplicates from the data
+        data = list(dict.fromkeys(data))  # deterministic, as opposed to set()
+        
+        # strip whitespace around each example
+        data = [x.strip() for x in data]
+
+        # remove newlines from each example
+        data = [strip_newlines(x) for x in data]
     else:
-        data = datasets.load_dataset(dataset, split=f'train[:10000]', cache_dir=cache_dir)[key]
+        data = dataset
 
     # get unique examples, strip whitespace, and remove newlines
     # then take just the long examples, shuffle, take the first 5,000 to tokenize to save time
     # then take just the examples that are <= 512 tokens (for the mask model)
     # then generate n_samples samples
 
-    # remove duplicates from the data
-    data = list(dict.fromkeys(data))  # deterministic, as opposed to set()
-
-    # strip whitespace around each example
-    data = [x.strip() for x in data]
-
-    # remove newlines from each example
-    data = [strip_newlines(x) for x in data]
-
     # try to keep only examples with > 100 words
     #if dataset in ['writing', 'squad', 'xsum']:
-    long_data = [x for x in data if len(x.split()) > 100]
-    if len(long_data) > 0:
-        data = long_data
+    # long_data = [x for x in data if len(x.split()) > 100]
+    # print(len(long_data))
+    # if len(long_data) > 0:
+    #     data = long_data
 
     
     not_too_long_data = [x for x in data if len(x.split()) < args.max_length]
@@ -771,7 +782,10 @@ def load_base_model_and_tokenizer(name):
             base_model_kwargs.update(dict(torch_dtype=torch.float16))
         if 'gpt-j' in name:
             base_model_kwargs.update(dict(revision='float16'))
-        base_model = transformers.AutoModelForCausalLM.from_pretrained(name, **base_model_kwargs, cache_dir=cache_dir)
+        if 'llama' in name:
+            base_model = transformers.AutoModelForCausalLM.from_pretrained(name, **base_model_kwargs, use_flash_attention_2=True, torch_dtype=torch.bfloat16, trust_remote_code = True, cache_dir=cache_dir)
+        else:
+            base_model = transformers.AutoModelForCausalLM.from_pretrained(name, **base_model_kwargs, cache_dir=cache_dir)
     else:
         base_model = None
 
@@ -781,8 +795,16 @@ def load_base_model_and_tokenizer(name):
         optional_tok_kwargs['fast'] = False
     if args.dataset_member in ['pubmed'] or args.dataset_nonmember in ['pubmed']:
         optional_tok_kwargs['padding_side'] = 'left'
-    base_tokenizer = transformers.AutoTokenizer.from_pretrained(name, **optional_tok_kwargs, cache_dir=cache_dir)
-    base_tokenizer.pad_token_id = base_tokenizer.eos_token_id
+    
+    if 'llama' in name:
+        base_tokenizer = ""
+    else:
+        base_tokenizer = transformers.AutoTokenizer.from_pretrained(name, **optional_tok_kwargs, cache_dir=cache_dir)
+        
+        if args.dataset_member in ['forget'] or args.dataset_nonmember in ['retain']:
+            base_tokenizer.pad_token = base_tokenizer.eos_token
+        else:
+            base_tokenizer.pad_token_id = base_tokenizer.eos_token_id
 
     return base_model, base_tokenizer
 
@@ -856,6 +878,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_perturbation_list', type=str, default="1,10")
     parser.add_argument('--n_perturbation_rounds', type=int, default=1)
     parser.add_argument('--base_model_name', type=str, default="gpt2-medium")
+    parser.add_argument('--base_tokenizer_name', type=str, default=None)
     parser.add_argument('--revision', type=str, default="main")
     parser.add_argument('--scoring_model_name', type=str, default="")
     parser.add_argument('--mask_filling_model_name', type=str, default="t5-large")
@@ -888,14 +911,20 @@ if __name__ == '__main__':
     parser.add_argument('--max_tries', type=int, default=100)
     parser.add_argument('--max_length', type=int, default=None)
     parser.add_argument('--ceil_pct', action='store_true')
-
-
-
-
+    parser.add_argument('--config_name', type=str, default='/p/compressionleakage/llm_privacy/tofu/config/forget.yaml')
+    parser.add_argument('--model_config', type=str, default='/p/compressionleakage/llm_privacy/tofu/config/model_config.yaml')
 
     args = parser.parse_args()
 
     API_TOKEN_COUNTER = 0
+
+    cfg = get_config_from_yaml(args.config_name)
+    model_cfg = get_model_identifiers_from_yaml(cfg['model_family'])
+    args.base_model_name = model_cfg['forgot_model_path']
+    args.base_tokenizer_name = model_cfg['hf_key']
+    cfg['max_length'] = args.max_length
+    print(f"Base model: {args.base_model_name}")
+    # exit(0)
 
     if args.openai_model is not None:
         import openai
@@ -974,12 +1003,16 @@ if __name__ == '__main__':
     GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained('gpt2', cache_dir=cache_dir)
 
     # generic generative model
-    base_model, base_tokenizer = load_base_model_and_tokenizer(args.base_model_name)
-
+    base_model, _ = load_base_model_and_tokenizer(args.base_model_name)
+    _, base_tokenizer = load_base_model_and_tokenizer(args.base_tokenizer_name)
 
     #reference model if we are doing the lr baseline
     if args.ref_model is not None :
-        ref_model, ref_tokenizer = load_base_model_and_tokenizer(args.ref_model)
+        if 'llama' in args.ref_model:
+            ref_model, _ = load_base_model_and_tokenizer(args.ref_model)
+            _, ref_tokenizer = load_base_model_and_tokenizer(args.base_tokenizer_name)
+        else:
+            ref_model, ref_tokenizer = load_base_model_and_tokenizer(args.ref_model)
         load_ref_model()
 
     # mask filling t5 model
@@ -1008,9 +1041,15 @@ if __name__ == '__main__':
     print(f'Loading dataset {args.dataset_member} and {args.dataset_nonmember}...')
     # data, seq_lens, n_samples = generate_data(args.dataset_member,args.dataset_member_key)
     
-    data_member = generate_data(args.dataset_member,args.dataset_member_key)
-    data_nonmember  = generate_data( args.dataset_nonmember,  args.dataset_nonmember_key,train=False) 
+    if args.dataset_member in ['forget'] or args.dataset_nonmember in ['retain']:
+        data_member, data_nonmember = custom_datasets.load_llama_data(cfg, model_cfg, base_tokenizer)
+        data_member = generate_data(data_member, args.dataset_member_key)
+        data_nonmember = generate_data(data_nonmember, args.dataset_nonmember_key)
+    else:
+        data_member = generate_data(args.dataset_member,args.dataset_member_key)
+        data_nonmember  = generate_data( args.dataset_nonmember,  args.dataset_nonmember_key,train=False) 
 
+    
     data, seq_lens, n_samples = generate_samples(data_member[:n_samples], data_nonmember[:n_samples], batch_size=batch_size)
 
     print("NEW N_SAMPLES IS ", n_samples)

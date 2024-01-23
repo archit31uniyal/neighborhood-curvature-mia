@@ -3,13 +3,13 @@ import datasets
 import os
 import json
 from typing import List
-
+import data_module
+from tqdm import tqdm
 
 SEPARATOR = '<<<SEP>>>'
 
 
 DATASETS = ['writing', 'english', 'german', 'pubmed']
-
 
 def load_pubmed(cache_dir):
     data = datasets.load_dataset('pubmed_qa', 'pqa_labeled', split='train', cache_dir=cache_dir)
@@ -118,3 +118,29 @@ def load(name, cache_dir, **kwargs):
         return load_fn(cache_dir=cache_dir, **kwargs)
     else:
         raise ValueError(f'Unknown dataset {name}')
+
+
+def load_llama_data(cfg, model_cfg, tokenizer):
+    member_data, nonmember_data = [], []
+
+    forget_data = datasets.load_dataset('json', data_files={'train': os.path.join(cfg["data_path"], cfg["split"]+".json")})
+    forget_data = forget_data['train']
+    retain_split = "retain" + str(100 - int(cfg["split"].replace("forget", ""))).zfill(2)
+    retain_data = datasets.load_dataset('json', data_files={'train': os.path.join(cfg["data_path"], retain_split+".json")})
+    retain_data = retain_data['train']
+
+    for data_type in ["forget", "retain"]:
+        data = forget_data if data_type != "retain" else retain_data
+        for idx in tqdm(range(len(data)), desc = f"Loading {data_type} data"):
+            question = data[idx]['question']
+            answer = data[idx]['answer']
+            converted_data = data_module.convert_raw_data_to_attack_format(tokenizer, cfg['max_length'], question, answer, model_cfg)
+            if data_type == "forget":
+                member_data.append(converted_data)
+            else:
+                nonmember_data.append(converted_data)
+    
+    return member_data, nonmember_data
+
+
+ 
