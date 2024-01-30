@@ -424,7 +424,8 @@ def save_roc_curves(experiments):
     plt.ylim([0.0, 1.05])
     plt.xlabel('False Positive Rate')
     plt.ylabel('True Positive Rate')
-    plt.title(f'ROC Curves ({base_model_name} - {args.mask_filling_model_name})')
+    if 'gpt-neo' in base_model_name:
+        plt.title(f'ROC Curves (gpt-neo - {args.mask_filling_model_name})')
     plt.legend(loc="lower right", fontsize=6)
     plt.savefig(f"{SAVE_FOLDER}/roc_curves.png")
 
@@ -719,10 +720,10 @@ def generate_data(dataset, key, train=True):
             #data_files ="/home/niloofar/projects/maildir"
             #data = datasets.load_dataset("json", data_files=data_files, split="train", cache_dir=cache_dir)[key]
             #data = datasets.load_dataset("json",data_files=data_files, split='train', cache_dir=cache_dir)[key]https://the-eye.eu/public/AI/pile/train/00.jsonl.zst"
-            data = datasets.load_dataset("json", data_files="/trunk/datasets/niloofar/pile/00.jsonl.zst",  split=f"{data_split}[:10000]")[key]
+            data = datasets.load_dataset("json", data_files= 'cache_100_200_1000_512/train/the_pile_pubmed_abstracts.json', cache_dir=cache_dir)[data_split][key]
         elif dataset == 'the_pile' and data_split=='test':
             print("test")
-            data = datasets.load_dataset("json", data_files="/trunk/datasets/niloofar/pile/test.jsonl.zst",split=f"train[:10000]")[key]
+            data = datasets.load_dataset("json", data_files="cache_100_200_1000_512/train/the_pile_pubmed_abstracts.json", cache_dir=cache_dir)[data_split][key]
         else:
             data = datasets.load_dataset(dataset, split=f'train[:10000]', cache_dir=cache_dir)[key]
         
@@ -744,10 +745,10 @@ def generate_data(dataset, key, train=True):
 
     # try to keep only examples with > 100 words
     #if dataset in ['writing', 'squad', 'xsum']:
-    # long_data = [x for x in data if len(x.split()) > 100]
+    long_data = [x for x in data if len(x.split()) > 100]
     # print(len(long_data))
-    # if len(long_data) > 0:
-    #     data = long_data
+    if len(long_data) > 0:
+        data = long_data
 
     
     not_too_long_data = [x for x in data if len(x.split()) < args.max_length]
@@ -785,7 +786,7 @@ def load_base_model_and_tokenizer(name):
         if 'llama' in name:
             base_model = transformers.AutoModelForCausalLM.from_pretrained(name, **base_model_kwargs, use_flash_attention_2=True, torch_dtype=torch.bfloat16, trust_remote_code = True, cache_dir=cache_dir)
         else:
-            base_model = transformers.AutoModelForCausalLM.from_pretrained(name, **base_model_kwargs, cache_dir=cache_dir)
+            base_model = transformers.AutoModelForCausalLM.from_pretrained(name, **base_model_kwargs, use_flash_attention_2=False, torch_dtype=torch.bfloat16, trust_remote_code = True, cache_dir=cache_dir)
     else:
         base_model = None
 
@@ -796,7 +797,7 @@ def load_base_model_and_tokenizer(name):
     if args.dataset_member in ['pubmed'] or args.dataset_nonmember in ['pubmed']:
         optional_tok_kwargs['padding_side'] = 'left'
     
-    if 'llama' in name:
+    if 'llama' in name or 'checkpoint' in name:
         base_tokenizer = ""
     else:
         base_tokenizer = transformers.AutoTokenizer.from_pretrained(name, **optional_tok_kwargs, cache_dir=cache_dir)
@@ -863,6 +864,57 @@ def eval_supervised(data, model):
         'loss': 1 - pr_auc,
     }
 
+    
+def get_token_prob(base_model, unlearned_model, 
+                   base_tokenizer, args, top_k: int = 5):
+    """
+    Get the top-k token probabilities for the base model and unlearned model.
+
+    Args:
+        base_model (PreTrainedModel): The base language model.
+        unlearned_model (PreTrainedModel): The unlearned version of the language model.
+        base_tokenizer (PreTrainedTokenizer): The tokenizer used for both models.
+        data (list): List of input texts for which token probabilities will be calculated.
+        top_k (int, optional): Number of top tokens to consider. Defaults to 5.
+
+    Returns:
+        dict: Dictionary containing top-k token probabilities for the base model.
+        dict: Dictionary containing top-k token probabilities for the unlearned model.
+    """
+    base_probs_dict = {}
+    unlearned_probs_dict = {}
+    data = generate_data(args.dataset_member, args.dataset_member_key)
+    # Iterate over the data
+    for text in data:
+        # Tokenize input text
+        input_ids = base_tokenizer.encode(text, return_tensors='pt')
+
+        # Get token probabilities from the base model
+        with torch.no_grad():
+            base_output = base_model(input_ids)
+            base_probs = torch.nn.functional.softmax(base_output.logits, dim=-1)[0]
+
+        # Get top-k tokens and their probabilities for the base model
+        base_top_k_probs, base_top_k_indices = torch.topk(base_probs, top_k)
+        base_top_k_tokens = base_tokenizer.convert_ids_to_tokens(base_top_k_indices.tolist())
+
+        # Store results in the dictionary
+        base_probs_dict[text] = dict(zip(base_top_k_tokens, base_top_k_probs.tolist()))
+
+        # Get token probabilities from the unlearned model
+        with torch.no_grad():
+            unlearned_output = unlearned_model(input_ids)
+            unlearned_probs = torch.nn.functional.softmax(unlearned_output.logits, dim=-1)[0]
+
+        # Get top-k tokens and their probabilities for the unlearned model
+        unlearned_top_k_probs, unlearned_top_k_indices = torch.topk(unlearned_probs, top_k)
+        unlearned_top_k_tokens = base_tokenizer.convert_ids_to_tokens(unlearned_top_k_indices.tolist())
+
+        # Store results in the dictionary
+        unlearned_probs_dict[text] = dict(zip(unlearned_top_k_tokens, unlearned_top_k_probs.tolist()))
+
+    return base_probs_dict, unlearned_probs_dict
+
 
 if __name__ == '__main__':
     DEVICE = "cuda"
@@ -911,20 +963,30 @@ if __name__ == '__main__':
     parser.add_argument('--max_tries', type=int, default=100)
     parser.add_argument('--max_length', type=int, default=None)
     parser.add_argument('--ceil_pct', action='store_true')
-    parser.add_argument('--config_name', type=str, default='/p/compressionleakage/llm_privacy/tofu/config/forget.yaml')
-    parser.add_argument('--model_config', type=str, default='/p/compressionleakage/llm_privacy/tofu/config/model_config.yaml')
+    parser.add_argument('--config_name', type=str, default='/sfs/weka/scratch/deu9yh/llm_privacy/tofu/config/forget.yaml')
+    parser.add_argument('--model_config', type=str, default='/sfs/weka/scratch/deu9yh/llm_privacy/tofu/config/model_config.yaml')
+    parser.add_argument('--base', action='store_false')
+    parser.add_argument("--unlearned_model", type=str, default = None)
+    parser.add_argument('--token_prob', action = 'store_true')
 
     args = parser.parse_args()
 
     API_TOKEN_COUNTER = 0
 
+    
     cfg = get_config_from_yaml(args.config_name)
     model_cfg = get_model_identifiers_from_yaml(cfg['model_family'])
-    args.base_model_name = model_cfg['forgot_model_path']
-    args.base_tokenizer_name = model_cfg['hf_key']
+    if not args.base:
+        args.base_model_name = model_cfg['forgot_model_path']
+        args.base_tokenizer_name = model_cfg['hf_key']
     cfg['max_length'] = args.max_length
     print(f"Base model: {args.base_model_name}")
+    if args.token_prob:
+        args.unlearned_model = model_cfg['forget_model_path']
     # exit(0)
+
+    if args.base_tokenizer_name is None:
+        args.base_tokenizer_name = args.base_model_name
 
     if args.openai_model is not None:
         import openai
@@ -970,7 +1032,10 @@ if __name__ == '__main__':
     dataset_member_name=args.dataset_member.replace('/', '_')
     dataset_nonmember_name=args.dataset_nonmember.replace('/', '_')
 
-    SAVE_FOLDER = f"tmp_results/{output_subfolder}{base_model_name}-{args.revision}{scoring_model_string}-{args.mask_filling_model_name}-{sampling_string}/{precision_string}-{args.pct_words_masked}-{args.n_perturbation_rounds}-{dataset_member_name}-{dataset_nonmember_name}-{args.n_samples}{ref_model_string}{span_length_string}{max_length_string}{tok_by_tok_string}"
+    if not args.token_prob:
+        SAVE_FOLDER = f"tmp_results/{output_subfolder}{base_model_name}-{args.revision}{scoring_model_string}-{args.mask_filling_model_name}-{sampling_string}/{precision_string}-{args.pct_words_masked}-{args.n_perturbation_rounds}-{dataset_member_name}-{dataset_nonmember_name}-{args.n_samples}{ref_model_string}{span_length_string}{max_length_string}{tok_by_tok_string}"
+    else:
+        SAVE_FOLDER = f"tmp_results/{output_subfolder}{base_model_name}-{args.revision}{scoring_model_string}-{args.mask_filling_model_name}-{sampling_string}/{precision_string}-{args.pct_words_masked}-{args.n_perturbation_rounds}-{dataset_member_name}-{dataset_nonmember_name}-{args.n_samples}{ref_model_string}{span_length_string}{max_length_string}{tok_by_tok_string}-{args.unlearned_model}-token_prob"
 
     new_folder = SAVE_FOLDER.replace("tmp_results", "results")
     ##don't run if exists!!!
@@ -1003,8 +1068,13 @@ if __name__ == '__main__':
     GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained('gpt2', cache_dir=cache_dir)
 
     # generic generative model
+
     base_model, _ = load_base_model_and_tokenizer(args.base_model_name)
     _, base_tokenizer = load_base_model_and_tokenizer(args.base_tokenizer_name)
+    unlearned_model, _ = load_base_model_and_tokenizer(args.unlearned_model)
+
+    if args.token_prob:
+        token_prob_base, token_prob_unlearned = get_token_prob(base_model, unlearned_model, base_tokenizer, args)
 
     #reference model if we are doing the lr baseline
     if args.ref_model is not None :
@@ -1046,8 +1116,8 @@ if __name__ == '__main__':
         data_member = generate_data(data_member, args.dataset_member_key)
         data_nonmember = generate_data(data_nonmember, args.dataset_nonmember_key)
     else:
-        data_member = generate_data(args.dataset_member,args.dataset_member_key)
-        data_nonmember  = generate_data( args.dataset_nonmember,  args.dataset_nonmember_key,train=False) 
+        data_member = generate_data(args.dataset_member, args.dataset_member_key)
+        data_nonmember  = generate_data( args.dataset_nonmember,  args.dataset_nonmember_key, train=False) 
 
     
     data, seq_lens, n_samples = generate_samples(data_member[:n_samples], data_nonmember[:n_samples], batch_size=batch_size)

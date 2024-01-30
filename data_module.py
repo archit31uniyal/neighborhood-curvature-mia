@@ -19,7 +19,7 @@ def get_model_identifiers_from_yaml(model_family):
     '''
     model_configs  = {}
     # print(model_family)
-    with open("/p/compressionleakage/llm_privacy/tofu/config/model_config.yaml", "r") as f:
+    with open("/sfs/weka/scratch/deu9yh/llm_privacy/tofu/config/model_config.yaml", "r") as f:
         model_configs = yaml.load(f, Loader=yaml.FullLoader)
     # print(model_configs)
     return model_configs[model_family]

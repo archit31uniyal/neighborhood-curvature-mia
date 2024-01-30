@@ -141,6 +141,3 @@ def load_llama_data(cfg, model_cfg, tokenizer):
                 nonmember_data.append(converted_data)
     
     return member_data, nonmember_data
-
-
- 
