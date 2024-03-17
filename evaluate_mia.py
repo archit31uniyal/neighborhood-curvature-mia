@@ -5,7 +5,7 @@ import transformers
 import re
 import torch
 import torch.nn.functional as F
-import tqdm
+from tqdm import tqdm
 import random
 from sklearn.metrics import roc_curve, precision_recall_curve, auc
 import argparse
@@ -19,11 +19,8 @@ from multiprocessing.pool import ThreadPool
 import time
 import math
 import yaml
-
-
-torch.manual_seed(0)
-np.random.seed(0)
-random.seed(0)
+import shutil
+import random
 
 # 15 colorblind-friendly colors
 COLORS = ["#0072B2", "#009E73", "#D55E00", "#CC79A7", "#F0E442",
@@ -110,7 +107,6 @@ def tokenize_and_mask(text, span_length, pct, ceil_pct=False):
 
 def count_masks(texts):
     return [len([x for x in text.split() if x.startswith("<extra_id_")]) for text in texts]
-
 
 # replace each masked span with a sample from T5 mask_model
 def replace_masks(texts):
@@ -209,7 +205,7 @@ def perturb_texts(texts, span_length, pct, ceil_pct=False):
         chunk_size //= 2
 
     outputs = []
-    for i in tqdm.tqdm(range(0, len(texts), chunk_size), desc="Applying perturbations"):
+    for i in tqdm(range(0, len(texts), chunk_size), desc="Applying perturbations"):
         outputs.extend(perturb_texts_(texts[i:i + chunk_size], span_length, pct, ceil_pct=ceil_pct))
     return outputs
 
@@ -421,7 +417,7 @@ def get_minK(text):
 
     with torch.no_grad():
         p1, all_prob, p1_likelihood = calculatePerplexity(text, base_model, base_tokenizer, gpu=DEVICE)
-        # p_ref, all_prob_ref, p_ref_likelihood = calculatePerplexity(text, ref_model, ref_tokenizer, gpu=DEVICE)
+        p_ref, all_prob_ref, p_ref_likelihood = calculatePerplexity(text, ref_model, ref_tokenizer, gpu=DEVICE)
 
         # for ratio in [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:
         ratio = 0.20
@@ -430,12 +426,12 @@ def get_minK(text):
         topk_prob = np.sort(all_prob)[:k_length]
         pred_base = -np.mean(topk_prob).item()
 
-        # k_length = int(len(all_prob_ref)*ratio)
-        # topk_prob = np.sort(all_prob_ref)[:k_length]
-        # pred_ref = -np.mean(topk_prob).item()
+        k_length = int(len(all_prob_ref)*ratio)
+        topk_prob = np.sort(all_prob_ref)[:k_length]
+        pred_ref = -np.mean(topk_prob).item()
 
-        # score = pred_base/pred_ref
-        score = pred_base
+        score = pred_base/pred_ref
+        # score = pred_base
 
         return score
         
@@ -533,45 +529,24 @@ def save_llr_histograms(experiments):
         except:
             pass
 
-def generate_threshold(scores, true_labels, target_false_positive_rate=0.01):
+def generate_threshold(criterion_fn, name, non_member, target_false_positive_rate=0.01):
     """
     Generate a threshold for low false positive rates in a membership inference attack.
-
-    Parameters:
-    - scores: List of model scores or probabilities.
-    - true_labels: List of true membership labels (0 for non-member, 1 for member).
-    - target_false_positive_rate: Target false positive rate.
-
-    Returns:
-    - threshold: Threshold value for the given false positive rate.
     """
-
-    # Combine scores and true labels into tuples for sorting
-    data = list(zip(scores, true_labels))
-    data.sort(reverse=True)  # Sort in descending order based on scores
-
-    total_positives = sum(true_labels)
-    false_positives = 0
-
-    # Iterate through sorted data to find the threshold
-    for i, (score, label) in enumerate(data):
-        if label == 0:
-            false_positives += 1
-
-        current_false_positive_rate = false_positives / (i + 1)
-
-        # Check if the current false positive rate is below the target
-        if current_false_positive_rate <= target_false_positive_rate:
-            threshold = score
-            break
-
+    non_member_preds = []
+    for text in tqdm(non_member, desc = f'Calculating threshold {name}_criterion', total=len(non_member)):
+        non_member_preds.append(criterion_fn(text))
+    
+    non_member_preds.sort()
+    threshold = non_member_preds[int(len(non_member_preds)*target_false_positive_rate)]
+    print(f'Threshold {name}_criterion: {threshold}')
     return threshold
 
-def get_perturbation_results(span_length=10, n_perturbations=1, n_samples=500):
+def get_perturbation_results(args, span_length=10, n_perturbations=1, n_samples=500):
     load_mask_model()
 
-    torch.manual_seed(0)
-    np.random.seed(0)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     results = []
     original_text = data["nonmember"]
@@ -606,7 +581,7 @@ def get_perturbation_results(span_length=10, n_perturbations=1, n_samples=500):
     load_base_model()
 #    load_ref_model()
 
-    for res in tqdm.tqdm(results, desc="Computing log likelihoods"):
+    for res in tqdm(results, desc="Computing log likelihoods"):
         p_sampled_ll = get_lls(res["perturbed_sampled"])
         p_original_ll = get_lls(res["perturbed_original"])
         res["original_ll"] = get_ll(res["nonmember"])
@@ -669,16 +644,24 @@ def run_perturbation_experiment(results, criterion, span_length=10, n_perturbati
         'loss': 1 - pr_auc,
     }
 
+def attack_success_rate(preds, labels):
+    tp = [idx for idx, (i,j) in enumerate(zip(preds, labels)) if abs(i-j)== 0]
+    asr = len(tp)/len(labels)
 
-def run_baseline_threshold_experiment(criterion_fn, name, n_samples=500):
-    torch.manual_seed(0)
-    np.random.seed(0)
+    return asr, tp
+
+def compute_asr(criterion_fn, name, args, n_samples=50):
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     results = []
-    for batch in tqdm.tqdm(range(n_samples // batch_size), desc=f"Computing {name} criterion"):
+    threshold_set = random.sample(data['nonmember'], int(0.20 * len(data['nonmember'])))
+    threshold = generate_threshold(criterion_fn, name, threshold_set, target_false_positive_rate=0.05)
+    for batch in tqdm(range(n_samples // batch_size), desc=f"Computing {name} criterion"):
         original_text = data["nonmember"][batch * batch_size:(batch + 1) * batch_size]
         sampled_text = data["member"][batch * batch_size:(batch + 1) * batch_size]
-
+        # threshold = generate_threshold(criterion_fn, name, original_text[-20:], target_false_positive_rate=0.05)
+        
         for idx in range(len(original_text)):
             results.append({
                 "nonmember": original_text[idx],
@@ -687,18 +670,29 @@ def run_baseline_threshold_experiment(criterion_fn, name, n_samples=500):
                 "member_crit": criterion_fn(sampled_text[idx]),
             })
 
-    # compute prediction scores for real/sampled passages
     predictions = {
         'real': [x["nonmember_crit"] for x in results],
         'samples': [x["member_crit"] for x in results],
     }
+    # compute prediction scores for real/sampled passages
+    predictions_asr = {
+        'real': [0 if x["nonmember_crit"]>threshold else 1 for x in results],
+        'samples': [0 if x["member_crit"]>threshold else 1 for x in results],
+    }
+
+    preds = predictions_asr['real'] + predictions_asr['samples']
+    labels = [0] * len(predictions_asr['real']) + [1] * len(predictions_asr['samples'])
+    total_members = len(predictions_asr['samples'])
+    total_nonmembers = len(predictions_asr['real'])
+    asr, tp = attack_success_rate(preds, labels)
 
     fpr, tpr, roc_auc = get_roc_metrics(predictions['real'], predictions['samples'])
     p, r, pr_auc = get_precision_recall_metrics(predictions['real'], predictions['samples'])
-    print(f"{name}_threshold ROC AUC: {roc_auc}, PR AUC: {pr_auc}")
+    print(f"{name}_threshold ROC AUC: {roc_auc}, PR AUC: {pr_auc}, ASR: {asr}")
     return {
         'name': f'{name}_threshold',
         'predictions': predictions,
+        'predictions_asr': predictions_asr,
         'info': {
             'n_samples': n_samples,
         },
@@ -712,6 +706,12 @@ def run_baseline_threshold_experiment(criterion_fn, name, n_samples=500):
             'pr_auc': pr_auc,
             'precision': p,
             'recall': r,
+        },
+        'asr': {
+            'rate': asr,
+            'true_positive': tp,
+            'member_count': total_members,
+            'nonmember_count': total_nonmembers
         },
         'loss': 1 - pr_auc,
     }
@@ -744,9 +744,9 @@ def truncate_to_substring(text, substring, idx_occurrence):
     return text[:idx]
 
 
-def generate_samples(raw_data_member, raw_data_non_member, batch_size):
-    torch.manual_seed(42)
-    np.random.seed(42)
+def generate_samples(raw_data_member, raw_data_non_member, batch_size, args):
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     data = {
         "nonmember": [],
         "member": [],
@@ -772,7 +772,6 @@ def generate_samples(raw_data_member, raw_data_non_member, batch_size):
 
             if args.tok_by_tok:
                 for tok_cnt in range(len(o.split(' '))):
-
                     data["nonmember"].append(' '.join(o.split(' ')[:tok_cnt+1]))
                     data["member"].append(' '.join(s.split(' ')[:tok_cnt+1]))
             else:
@@ -791,7 +790,7 @@ def generate_samples(raw_data_member, raw_data_non_member, batch_size):
     return data, seq_lens, n_samples
 
 
-def generate_data(dataset, key, train=True):
+def generate_data(dataset, key, args, train=True):
     # load data
     data_split = 'train' if train else 'test'
     if type(dataset) == str:
@@ -816,7 +815,7 @@ def generate_data(dataset, key, train=True):
             data = data[:5000]
         elif 'harry_potter' in dataset or 'hp' in dataset:
             data = datasets.load_dataset('csv', data_files={'train': dataset})[data_split][key]
-            data = data[:149]
+            # data = data[:149]
         else:
             data = datasets.load_dataset(dataset, split=f'train[:10000]', cache_dir=cache_dir)[key]
         
@@ -850,7 +849,7 @@ def generate_data(dataset, key, train=True):
         data = not_too_long_data
     # print(len(data))
 
-    random.seed(0)
+    random.seed(args.seed)
     random.shuffle(data)
 
     data = data[:5_000]
@@ -915,14 +914,14 @@ def eval_supervised(data, model):
     with torch.no_grad():
         # get predictions for real
         real_preds = []
-        for batch in tqdm.tqdm(range(len(real) // batch_size), desc="Evaluating real"):
+        for batch in tqdm(range(len(real) // batch_size), desc="Evaluating real"):
             batch_real = real[batch * batch_size:(batch + 1) * batch_size]
             batch_real = tokenizer(batch_real, padding=True, truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
             real_preds.extend(detector(**batch_real).logits.softmax(-1)[:,0].tolist())
         
         # get predictions for fake
         fake_preds = []
-        for batch in tqdm.tqdm(range(len(fake) // batch_size), desc="Evaluating fake"):
+        for batch in tqdm(range(len(fake) // batch_size), desc="Evaluating fake"):
             batch_fake = fake[batch * batch_size:(batch + 1) * batch_size]
             batch_fake = tokenizer(batch_fake, padding=True, truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
             fake_preds.extend(detector(**batch_fake).logits.softmax(-1)[:,0].tolist())
@@ -1009,6 +1008,7 @@ def get_args():
     parser.add_argument('--base', action='store_false')
     parser.add_argument("--unlearned_model", type=str, default = None)
     parser.add_argument('--token_prob', action = 'store_true')
+    parser.add_argument('--seed', type=int, default=0)
 
     args = parser.parse_args()
     return args
@@ -1019,6 +1019,10 @@ if __name__ == '__main__':
     API_TOKEN_COUNTER = 0
 
     args = get_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
     cfg = get_config_from_yaml(args.config_name)
     model_cfg = get_model_identifiers_from_yaml(cfg['model_family'])
     if not args.base:
@@ -1086,8 +1090,10 @@ if __name__ == '__main__':
     ##don't run if exists!!!
     print(f"{new_folder}")
     if  os.path.isdir((new_folder)):
-        print(f"folder exists, not running this exp {new_folder}")
-        exit(0)
+        # print(f"folder exists, not running this exp {new_folder}")
+        # exit(0)
+        shutil.rmtree(new_folder)
+
 
     if not os.path.exists(SAVE_FOLDER):
         os.makedirs(SAVE_FOLDER)
@@ -1161,13 +1167,13 @@ if __name__ == '__main__':
     
     if args.dataset_member in ['forget'] or args.dataset_nonmember in ['retain']:
         data_member, data_nonmember = custom_datasets.load_llama_data(cfg, model_cfg, base_tokenizer)
-        data_member = generate_data(data_member, args.dataset_member_key)
-        data_nonmember = generate_data(data_nonmember, args.dataset_nonmember_key)
+        data_member = generate_data(data_member, args.dataset_member_key, args=args)
+        data_nonmember = generate_data(data_nonmember, args.dataset_nonmember_key, args=args)
     else:
-        data_member = generate_data(args.dataset_member, args.dataset_member_key)
-        data_nonmember  = generate_data( args.dataset_nonmember,  args.dataset_nonmember_key) 
+        data_member = generate_data(args.dataset_member, args.dataset_member_key, args=args)
+        data_nonmember  = generate_data( args.dataset_nonmember,  args.dataset_nonmember_key, args=args) 
     
-    data, seq_lens, n_samples = generate_samples(data_member[:n_samples], data_nonmember[:n_samples], batch_size=batch_size)
+    data, seq_lens, n_samples = generate_samples(data_member[:n_samples], data_nonmember[:n_samples], batch_size=batch_size, args=args)
 
     print("NEW N_SAMPLES IS ", n_samples)
     if args.random_fills:
@@ -1195,35 +1201,35 @@ if __name__ == '__main__':
         json.dump(seq_lens, f)
 
     if not args.skip_baselines:
-        baseline_outputs = [run_baseline_threshold_experiment(get_ll, "likelihood", n_samples=n_samples)]
+        baseline_outputs = [compute_asr(get_ll, "likelihood", args= args, n_samples=n_samples)]
 
 
         if args.openai_model is None:
             rank_criterion = lambda text: -get_rank(text, log=False)
-            baseline_outputs.append(run_baseline_threshold_experiment(rank_criterion, "rank", n_samples=n_samples))
+            baseline_outputs.append(compute_asr(rank_criterion, "rank", args=args, n_samples=n_samples))
             logrank_criterion = lambda text: -get_rank(text, log=True)
-            baseline_outputs.append(run_baseline_threshold_experiment(logrank_criterion, "log_rank", n_samples=n_samples))
+            baseline_outputs.append(compute_asr(logrank_criterion, "log_rank", args=args, n_samples=n_samples))
             entropy_criterion = lambda text: get_entropy(text)
-            baseline_outputs.append(run_baseline_threshold_experiment(entropy_criterion, "entropy", n_samples=n_samples))
+            baseline_outputs.append(compute_asr(entropy_criterion, "entropy", args=args, n_samples=n_samples))
             if args.ref_model is not None:
-                baseline_outputs.append(run_baseline_threshold_experiment(get_lira, "lr_ratio", n_samples=n_samples))
-                baseline_outputs.append(run_baseline_threshold_experiment(get_minK, "min_k", n_samples=n_samples))
+                baseline_outputs.append(compute_asr(get_lira, "lr_ratio", args=args, n_samples=n_samples))
+                baseline_outputs.append(compute_asr(get_minK, "min_k", args=args, n_samples=n_samples))
 
         # baseline_outputs.append(eval_supervised(data, model='roberta-base-openai-detector'))
         # baseline_outputs.append(eval_supervised(data, model='roberta-large-openai-detector'))
 
     outputs = []
 
-    if not args.baselines_only:
-        # run perturbation experiments
-        for n_perturbations in n_perturbation_list:
-            perturbation_results = get_perturbation_results(args.span_length, n_perturbations, n_samples)
-            for perturbation_mode in ['d', 'z']:
-                output = run_perturbation_experiment(
-                    perturbation_results, perturbation_mode, span_length=args.span_length, n_perturbations=n_perturbations, n_samples=n_samples)
-                outputs.append(output)
-                with open(os.path.join(SAVE_FOLDER, f"perturbation_{n_perturbations}_{perturbation_mode}_results.json"), "w") as f:
-                    json.dump(output, f)
+    # if not args.baselines_only:
+    #     # run perturbation experiments
+    #     for n_perturbations in n_perturbation_list:
+    #         perturbation_results = get_perturbation_results(args.span_length, n_perturbations, n_samples)
+    #         for perturbation_mode in ['d', 'z']:
+    #             output = run_perturbation_experiment(
+    #                 perturbation_results, perturbation_mode, span_length=args.span_length, n_perturbations=n_perturbations, n_samples=n_samples)
+    #             outputs.append(output)
+    #             with open(os.path.join(SAVE_FOLDER, f"perturbation_{n_perturbations}_{perturbation_mode}_results.json"), "w") as f:
+    #                 json.dump(output, f)
 
     if not args.skip_baselines:
         # write likelihood threshold results to a file
